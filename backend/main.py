@@ -1,176 +1,180 @@
-# main.py
-from flask import Flask, jsonify
-from supabase import create_client
-import pandas as pd
-from sklearn.neighbors import NearestNeighbors
-from sklearn.preprocessing import MinMaxScaler
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from datetime import datetime
+import uuid
+from supabase import create_client, Client
 import pickle
-import os
 import threading
 import time
+import os
+import math
 
-# Supabase config
-SUPABASE_URL = "https://ohqowvsqxtunqcadjlng.supabase.co"
-SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9ocW93dnNxeHR1bnFjYWRqbG5nIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjE0NTk3MjYsImV4cCI6MjA3NzAzNTcyNn0.PT9LbmDEz-_8nvgAHhFRGUMo2X15y-UZfB5_Oqc_adQ"
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+# ---------------------------------------------------
+# SUPABASE CONFIG
+# ---------------------------------------------------
+SUPABASE_URL = "https://yweqmaqruqnemntvpxel.supabase.co" 
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inl3ZXFtYXFydXFuZW1udHZweGVsIiwicm9sZSI6ImFub24iLCJpYXQiOjE3MzA3OTQwOTgsImV4cCI6MjA0NjM3MDA5OH0.caT9BazwCZuil5X1d8zVWeBrZINRTPxQiyL4nxBHblA"
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 app = Flask(__name__)
+CORS(app)
 
-MODEL_FILE = "knn_model.pkl"
-SCALER_FILE = "scaler.pkl"
-USER_SUMMARY_FILE = "user_summary.pkl"
+MODEL_FILE = "simple_model.pkl"
 
-# ------------------ Data Fetching ------------------ #
+
+# ===================================================
+# HELPER FUNCTIONS
+# ===================================================
+
+def cosine_similarity(list1, list2):
+    dot = sum(a * b for a, b in zip(list1, list2))
+    mag1 = math.sqrt(sum(a * a for a in list1))
+    mag2 = math.sqrt(sum(a * a for a in list2))
+    return dot / (mag1 * mag2) if mag1 and mag2 else 0
+
+
 def fetch_data():
+    """Fetch all required tables"""
     try:
         users = supabase.table("users").select("*").execute().data
         products = supabase.table("products").select("*").execute().data
         history = supabase.table("purchase_history").select("*").execute().data
+        return users, products, history
     except Exception as e:
-        print(f"Error fetching data: {e}")
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+        print("Fetch Error:", e)
+        return [], [], []
 
-    users_df = pd.DataFrame(users)
-    products_df = pd.DataFrame(products)
-    history_df = pd.DataFrame(history)
 
-    # Ensure numeric and correct types
-    if not products_df.empty:
-        products_df["price"] = pd.to_numeric(products_df["price"], errors='coerce').fillna(0)
-        products_df["sustainability"] = products_df["sustainability"].apply(
-            lambda x: 1 if str(x).lower() in ["true","1","sustainable"] else 0
-        )
+# ===================================================
+# SECTION 1 — PRODUCT CHECK + INSERT
+# ===================================================
 
-    if not history_df.empty:
-        history_df["price_paid"] = pd.to_numeric(history_df["price_paid"], errors='coerce').fillna(0)
+@app.route("/check_by_name", methods=["GET"])
+def check_by_name():
+    table = request.args.get("table")
+    name = request.args.get("name")
 
-    return users_df, products_df, history_df
+    result = supabase.table(table).select("*").eq("name", name).execute()
+    if result.data:
+        return jsonify({"exists": True, "data": result.data})
+    return jsonify({"exists": False})
 
-# ------------------ Model Training ------------------ #
+
+@app.route("/check_product", methods=["GET"])
+def check_product():
+    qr_id = request.args.get("qr_id")
+    table = request.args.get("table")
+
+    result = supabase.table(table).select("*").eq("id", qr_id).execute()
+    if result.data:
+        return jsonify({"exists": True, "data": result.data})
+    return jsonify({"exists": False})
+
+
+@app.route("/insert_product", methods=["POST"])
+def insert_product():
+    data = request.json
+    table = data.get("table")
+    product_data = data.get("data")
+
+    product_data["uuid"] = str(uuid.uuid4())
+    product_data["created_at"] = datetime.utcnow().isoformat()
+
+    supabase.table(table).insert(product_data).execute()
+    return jsonify({"message": "Product added successfully"})
+
+
+# ===================================================
+# SECTION 2 — RECOMMENDATION SYSTEM (PURE PYTHON)
+# ===================================================
+
 def train_and_save_model():
-    users_df, products_df, history_df = fetch_data()
-    if history_df.empty or products_df.empty:
-        print("⚠️ Train failed: No data")
-        return None, None, None
+    users, products, history = fetch_data()
 
-    # Create user-product pivot table
-    merged = history_df.merge(products_df, left_on="product_id", right_on="id", how="left")
-    merged["sustainability"] = merged["sustainability"].astype(int)
-    merged["price_paid"] = merged["price_paid"].astype(float)
+    if not products or not history:
+        print("Not enough data to train model")
+        return None
 
-    pivot = merged.pivot_table(index="user_id", columns="product_id", values="price_paid", fill_value=0)
-    scaler = MinMaxScaler()
-    scaled = scaler.fit_transform(pivot)
+    # Create dictionary: { user_id: { product_id: price_paid } }
+    user_matrix = {}
 
-    knn = NearestNeighbors(n_neighbors=5, metric="cosine")
-    knn.fit(scaled)
+    for purchase in history:
+        uid = purchase["user_id"]
+        pid = purchase["product_id"]
+        price = float(purchase.get("price_paid", 0))
 
-    # Save model
-    with open(MODEL_FILE, "wb") as f:
-        pickle.dump(knn, f)
-    with open(SCALER_FILE, "wb") as f:
-        pickle.dump(scaler, f)
-    with open(USER_SUMMARY_FILE, "wb") as f:
-        pickle.dump(pivot, f)
+        if uid not in user_matrix:
+            user_matrix[uid] = {}
+        user_matrix[uid][pid] = price
 
-    print("✅ Auto retrain successful")
-    return knn, scaler, pivot
+    pickle.dump(user_matrix, open(MODEL_FILE, "wb"))
+    print("Model trained successfully")
+    return user_matrix
+
 
 def load_model():
-    if all(os.path.exists(f) for f in [MODEL_FILE, SCALER_FILE, USER_SUMMARY_FILE]):
-        try:
-            with open(MODEL_FILE, "rb") as f:
-                knn = pickle.load(f)
-            with open(SCALER_FILE, "rb") as f:
-                scaler = pickle.load(f)
-            with open(USER_SUMMARY_FILE, "rb") as f:
-                user_summary = pickle.load(f)
-            return knn, scaler, user_summary
-        except Exception as e:
-            print(f"⚠️ Load model failed: {e}")
-            return train_and_save_model()
-    else:
-        return train_and_save_model()
+    if os.path.exists(MODEL_FILE):
+        return pickle.load(open(MODEL_FILE, "rb"))
+    return train_and_save_model()
 
-# ------------------ Recommendation ------------------ #
-def recommend_for_user(user_id, n_recommend=5):
-    users_df, products_df, history_df = fetch_data()
-    knn, scaler, pivot = load_model()
 
-    if products_df.empty or knn is None:
-        print("⚠️ Recommendation error: No data or model")
-        return []
+def recommend_for_user(user_id, n=5):
+    users, products, history = fetch_data()
+    matrix = load_model()
 
-    # Ensure numeric columns
-    products_df["price"] = pd.to_numeric(products_df["price"], errors='coerce').fillna(0)
-    products_df["sustainability"] = products_df["sustainability"].apply(
-        lambda x: 1 if str(x).lower() in ["true","1","sustainable"] else 0
-    )
-    history_df["price_paid"] = pd.to_numeric(history_df["price_paid"], errors='coerce').fillna(0)
+    if user_id not in matrix:
+        # New user → return random products
+        return products[:n]
 
-    user_history = history_df[history_df["user_id"] == user_id]
+    target_vector = matrix[user_id]
 
-    # CASE 1: New user
-    if user_history.empty:
-        print("🟡 New user — showing mixed recommendations")
-        users_with_history = history_df["user_id"].unique()
-        purchased_ids = history_df[history_df["user_id"].isin(users_with_history)]["product_id"].unique()
-        available_products = products_df[products_df["id"].isin(purchased_ids)]
+    similarities = []
+    for other_user, product_vector in matrix.items():
+        if other_user == user_id:
+            continue
+        common_products = sorted(set(target_vector) | set(product_vector))
 
-        sustainable = available_products[available_products["sustainability"] == 1]
-        non_sustainable = available_products[available_products["sustainability"] == 0]
+        v1 = [target_vector.get(pid, 0) for pid in common_products]
+        v2 = [product_vector.get(pid, 0) for pid in common_products]
 
-        sustainable_sample = sustainable.sample(min(3, len(sustainable))) if len(sustainable) > 0 else pd.DataFrame()
-        non_sustainable_sample = non_sustainable.sample(min(3, len(non_sustainable))) if len(non_sustainable) > 0 else pd.DataFrame()
+        sim = cosine_similarity(v1, v2)
+        similarities.append((other_user, sim))
 
-        mixed = pd.concat([sustainable_sample, non_sustainable_sample])
-        if mixed.empty:
-            mixed = products_df.sample(min(n_recommend, len(products_df)))
-        else:
-            mixed = mixed.sample(frac=1).head(n_recommend)
+    # sort by highest similarity
+    similarities.sort(key=lambda x: x[1], reverse=True)
 
-        return mixed.to_dict(orient="records")
+    if not similarities:
+        return products[:n]
 
-    # CASE 2: Existing user
-    last_purchase = user_history.merge(products_df, left_on="product_id", right_on="id", how="left")
-    if last_purchase["sustainability"].sum() > 0:
-        avg_price = last_purchase["price_paid"].mean()
-        sustainable_products = products_df[
-            (products_df["sustainability"] == 1) & 
-            (products_df["price"] <= avg_price)
-        ]
-        recommendations = sustainable_products.sample(min(n_recommend, len(sustainable_products))) \
-                          if len(sustainable_products) > 0 else products_df.sample(min(n_recommend, len(products_df)))
-    else:
-        # User bought only non-sustainable → recommend all sustainable
-        sustainable_products = products_df[products_df["sustainability"] == 1]
-        recommendations = sustainable_products.sample(min(n_recommend, len(sustainable_products))) \
-                          if len(sustainable_products) > 0 else products_df.sample(min(n_recommend, len(products_df)))
+    best_user = similarities[0][0]
+    purchased_by_best = matrix[best_user].keys()
 
-    return recommendations.to_dict(orient="records")
+    recommended = [p for p in products if p["id"] in purchased_by_best]
+    return recommended[:n]
 
-# ------------------ Routes ------------------ #
-@app.route("/")
-def index():
-    return "✅ Recommendation Server is Running!"
 
 @app.route("/recommend/<user_id>")
 def recommend_api(user_id):
     try:
-        recs = recommend_for_user(user_id)
-        return jsonify(recs)
+        data = recommend_for_user(user_id)
+        return jsonify(data)
     except Exception as e:
-        print(f"⚠️ Recommendation error: {e}")
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": str(e)})
 
-# ------------------ Auto Retrain Thread ------------------ #
+
+# ===================================================
+# AUTO RE-TRAIN (EVERY 1 HOUR)
+# ===================================================
 def auto_retrain(interval=3600):
     while True:
-        try:
-            train_and_save_model()
-        except Exception as e:
-            print(f"⚠️ Auto retrain error: {e}")
+        train_and_save_model()
         time.sleep(interval)
+
+
+@app.route("/")
+def home():
+    return "🔥 Backend Running (Products + Recommendations)"
+
 
 if __name__ == "__main__":
     threading.Thread(target=auto_retrain, daemon=True).start()
